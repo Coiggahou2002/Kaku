@@ -1490,8 +1490,8 @@ fn signal_config_changed() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_editable_config_exists, normal_mode_action, App, Mode, NormalModeAction,
-        KAKU_AUTO_COLOR_SCHEME_EXPR,
+        ensure_editable_config_exists, normal_mode_action, App, ConfigField, Mode,
+        NormalModeAction, KAKU_AUTO_COLOR_SCHEME_EXPR,
     };
     use crossterm::event::KeyCode;
     use std::path::PathBuf;
