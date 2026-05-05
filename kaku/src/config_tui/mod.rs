@@ -616,12 +616,12 @@ impl App {
             let value_part = trimmed[eq_pos + 1..].trim();
 
             // Handle different value types
+            if value_part.starts_with("wezterm.font_with_fallback(") {
+                return Self::extract_font_with_fallback(value_part);
+            }
             if value_part.starts_with("wezterm.font(") {
-                // Extract font name from wezterm.font('Name') or wezterm.font("Name")
                 return Self::extract_quoted_arg(value_part, "wezterm.font(");
             }
-            // Unknown wezterm API call (e.g. wezterm.font_with_fallback): skip to
-            // avoid corrupting the value on write-back via to_lua_value.
             if value_part.starts_with("wezterm.") {
                 return None;
             }
@@ -662,6 +662,37 @@ impl App {
         let inner = &rest[1..];
         let end = inner.find(quote)?;
         Some(inner[..end].to_string())
+    }
+
+    /// Extracts all font names from `wezterm.font_with_fallback({ 'A', 'B' })`
+    /// and returns them as a comma-separated string (e.g. `"A, B"`).
+    fn extract_font_with_fallback(s: &str) -> Option<String> {
+        let rest = s.strip_prefix("wezterm.font_with_fallback(")?;
+        let mut fonts = Vec::new();
+        let mut i = 0;
+        let chars: Vec<char> = rest.chars().collect();
+        while i < chars.len() {
+            if chars[i] == '\'' || chars[i] == '"' {
+                let quote = chars[i];
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != quote {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    let name: String = chars[start..i].iter().collect();
+                    if !name.is_empty() {
+                        fonts.push(name);
+                    }
+                }
+            }
+            i += 1;
+        }
+        if fonts.is_empty() {
+            None
+        } else {
+            Some(fonts.join(", "))
+        }
     }
 
     fn strip_trailing_comment(s: &str) -> String {
@@ -1311,7 +1342,16 @@ impl App {
                     format!("'{}'", field.value)
                 }
             }
-            "font" => format!("wezterm.font('{}')", field.value),
+            "font" => {
+                let fonts: Vec<&str> = field.value.split(',').map(|s| s.trim()).collect();
+                if fonts.len() > 1 {
+                    let entries: Vec<String> =
+                        fonts.iter().map(|f| format!("'{}'", f)).collect();
+                    format!("wezterm.font_with_fallback({{ {} }})", entries.join(", "))
+                } else {
+                    format!("wezterm.font('{}')", field.value)
+                }
+            }
             "font_size"
             | "line_height"
             | "window_background_opacity"
@@ -2243,6 +2283,63 @@ mod tests {
             !content.contains("window_decorations"),
             "default state should remove explicit override, got:\n{}",
             content
+        );
+    }
+
+    #[test]
+    fn extract_font_with_fallback_single() {
+        let input = "wezterm.font_with_fallback({ 'MonoLisa' })";
+        assert_eq!(
+            App::extract_font_with_fallback(input),
+            Some("MonoLisa".into())
+        );
+    }
+
+    #[test]
+    fn extract_font_with_fallback_multiple() {
+        let input = "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })";
+        assert_eq!(
+            App::extract_font_with_fallback(input),
+            Some("MonoLisa, JetBrains Mono".into())
+        );
+    }
+
+    #[test]
+    fn extract_lua_value_reads_font_with_fallback() {
+        let content =
+            "config.font = wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })\n";
+        assert_eq!(
+            App::extract_lua_value(content, "font"),
+            Some("MonoLisa, JetBrains Mono".into())
+        );
+    }
+
+    #[test]
+    fn to_lua_value_single_font_uses_wezterm_font() {
+        let app = test_app();
+        let mut field = app
+            .fields
+            .iter()
+            .find(|f| f.lua_key == "font")
+            .expect("font field to exist")
+            .clone();
+        field.value = "MonoLisa".into();
+        assert_eq!(app.to_lua_value(&field), "wezterm.font('MonoLisa')");
+    }
+
+    #[test]
+    fn to_lua_value_comma_separated_uses_font_with_fallback() {
+        let app = test_app();
+        let mut field = app
+            .fields
+            .iter()
+            .find(|f| f.lua_key == "font")
+            .expect("font field to exist")
+            .clone();
+        field.value = "MonoLisa, JetBrains Mono".into();
+        assert_eq!(
+            app.to_lua_value(&field),
+            "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })"
         );
     }
 }
