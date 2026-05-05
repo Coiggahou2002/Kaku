@@ -616,12 +616,12 @@ impl App {
             let value_part = trimmed[eq_pos + 1..].trim();
 
             // Handle different value types
+            if value_part.starts_with("wezterm.font_with_fallback(") {
+                return Self::extract_font_with_fallback(value_part);
+            }
             if value_part.starts_with("wezterm.font(") {
-                // Extract font name from wezterm.font('Name') or wezterm.font("Name")
                 return Self::extract_quoted_arg(value_part, "wezterm.font(");
             }
-            // Unknown wezterm API call (e.g. wezterm.font_with_fallback): skip to
-            // avoid corrupting the value on write-back via to_lua_value.
             if value_part.starts_with("wezterm.") {
                 return None;
             }
@@ -662,6 +662,59 @@ impl App {
         let inner = &rest[1..];
         let end = inner.find(quote)?;
         Some(inner[..end].to_string())
+    }
+
+    /// Extracts font names from `wezterm.font_with_fallback({ 'A', 'B' })`.
+    ///
+    /// Only extracts top-level quoted strings; nested table entries like
+    /// `{ family = 'X', weight = 'Bold' }` are skipped entirely so that
+    /// attribute values are not mistaken for font names.  Returns `None`
+    /// when no simple font names can be extracted.
+    fn extract_font_with_fallback(s: &str) -> Option<String> {
+        let rest = s.strip_prefix("wezterm.font_with_fallback(")?;
+        let mut fonts = Vec::new();
+        let mut i = 0;
+        let chars: Vec<char> = rest.chars().collect();
+        let mut brace_depth: u32 = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '{' => {
+                    brace_depth += 1;
+                    if brace_depth > 1 {
+                        while i < chars.len() && chars[i] != '}' {
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            brace_depth -= 1;
+                        }
+                    }
+                }
+                '}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                }
+                '\'' | '"' if brace_depth == 1 => {
+                    let quote = chars[i];
+                    i += 1;
+                    let start = i;
+                    while i < chars.len() && chars[i] != quote {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        let name: String = chars[start..i].iter().collect();
+                        if !name.is_empty() {
+                            fonts.push(name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if fonts.is_empty() {
+            None
+        } else {
+            Some(fonts.join(", "))
+        }
     }
 
     fn strip_trailing_comment(s: &str) -> String {
@@ -1311,7 +1364,21 @@ impl App {
                     format!("'{}'", field.value)
                 }
             }
-            "font" => format!("wezterm.font('{}')", field.value),
+            "font" => {
+                let fonts: Vec<&str> = field
+                    .value
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if fonts.len() > 1 {
+                    let entries: Vec<String> =
+                        fonts.iter().map(|f| format!("'{}'", f)).collect();
+                    format!("wezterm.font_with_fallback({{ {} }})", entries.join(", "))
+                } else {
+                    format!("wezterm.font('{}')", fonts.first().unwrap_or(&""))
+                }
+            }
             "font_size"
             | "line_height"
             | "window_background_opacity"
@@ -1423,8 +1490,8 @@ fn signal_config_changed() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_editable_config_exists, normal_mode_action, App, Mode, NormalModeAction,
-        KAKU_AUTO_COLOR_SCHEME_EXPR,
+        ensure_editable_config_exists, normal_mode_action, App, ConfigField, Mode,
+        NormalModeAction, KAKU_AUTO_COLOR_SCHEME_EXPR,
     };
     use crossterm::event::KeyCode;
     use std::path::PathBuf;
@@ -2243,6 +2310,199 @@ mod tests {
             !content.contains("window_decorations"),
             "default state should remove explicit override, got:\n{}",
             content
+        );
+    }
+
+    // ── extract_font_with_fallback ──────────────────────────────────
+
+    #[test]
+    fn extract_font_with_fallback_single() {
+        let input = "wezterm.font_with_fallback({ 'MonoLisa' })";
+        assert_eq!(
+            App::extract_font_with_fallback(input),
+            Some("MonoLisa".into())
+        );
+    }
+
+    #[test]
+    fn extract_font_with_fallback_two() {
+        let input = "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })";
+        assert_eq!(
+            App::extract_font_with_fallback(input),
+            Some("MonoLisa, JetBrains Mono".into())
+        );
+    }
+
+    #[test]
+    fn extract_font_with_fallback_three() {
+        let input =
+            "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono', 'Courier New' })";
+        assert_eq!(
+            App::extract_font_with_fallback(input),
+            Some("MonoLisa, JetBrains Mono, Courier New".into())
+        );
+    }
+
+    #[test]
+    fn extract_font_with_fallback_double_quotes() {
+        let input = "wezterm.font_with_fallback({ \"Fira Code\", \"Cascadia Code\" })";
+        assert_eq!(
+            App::extract_font_with_fallback(input),
+            Some("Fira Code, Cascadia Code".into())
+        );
+    }
+
+    #[test]
+    fn extract_font_with_fallback_mixed_quotes() {
+        let input = "wezterm.font_with_fallback({ 'MonoLisa', \"JetBrains Mono\" })";
+        assert_eq!(
+            App::extract_font_with_fallback(input),
+            Some("MonoLisa, JetBrains Mono".into())
+        );
+    }
+
+    #[test]
+    fn extract_font_with_fallback_skips_nested_table() {
+        let input = "wezterm.font_with_fallback({ { family = 'MonoLisa', weight = 'Bold' }, 'JetBrains Mono' })";
+        assert_eq!(
+            App::extract_font_with_fallback(input),
+            Some("JetBrains Mono".into()),
+        );
+    }
+
+    #[test]
+    fn extract_font_with_fallback_all_nested_returns_none() {
+        let input = "wezterm.font_with_fallback({ { family = 'MonoLisa', weight = 'Bold' } })";
+        assert_eq!(App::extract_font_with_fallback(input), None);
+    }
+
+    #[test]
+    fn extract_font_with_fallback_empty_list() {
+        let input = "wezterm.font_with_fallback({})";
+        assert_eq!(App::extract_font_with_fallback(input), None);
+    }
+
+    #[test]
+    fn extract_font_with_fallback_wrong_prefix() {
+        let input = "wezterm.font('MonoLisa')";
+        assert_eq!(App::extract_font_with_fallback(input), None);
+    }
+
+    // ── extract_lua_value with font_with_fallback ────────────────────
+
+    #[test]
+    fn extract_lua_value_reads_font_with_fallback_two() {
+        let content =
+            "config.font = wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })\n";
+        assert_eq!(
+            App::extract_lua_value(content, "font"),
+            Some("MonoLisa, JetBrains Mono".into())
+        );
+    }
+
+    #[test]
+    fn extract_lua_value_reads_font_with_fallback_three() {
+        let content = "config.font = wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono', 'Courier New' })\n";
+        assert_eq!(
+            App::extract_lua_value(content, "font"),
+            Some("MonoLisa, JetBrains Mono, Courier New".into())
+        );
+    }
+
+    // ── to_lua_value font handling ───────────────────────────────────
+
+    fn font_field_with(value: &str) -> (App, ConfigField) {
+        let app = test_app();
+        let mut field = app
+            .fields
+            .iter()
+            .find(|f| f.lua_key == "font")
+            .expect("font field to exist")
+            .clone();
+        field.value = value.into();
+        (app, field)
+    }
+
+    #[test]
+    fn to_lua_value_single_font_uses_wezterm_font() {
+        let (app, field) = font_field_with("MonoLisa");
+        assert_eq!(app.to_lua_value(&field), "wezterm.font('MonoLisa')");
+    }
+
+    #[test]
+    fn to_lua_value_two_fonts_uses_font_with_fallback() {
+        let (app, field) = font_field_with("MonoLisa, JetBrains Mono");
+        assert_eq!(
+            app.to_lua_value(&field),
+            "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })"
+        );
+    }
+
+    #[test]
+    fn to_lua_value_three_fonts_uses_font_with_fallback() {
+        let (app, field) = font_field_with("MonoLisa, JetBrains Mono, Courier New");
+        assert_eq!(
+            app.to_lua_value(&field),
+            "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono', 'Courier New' })"
+        );
+    }
+
+    #[test]
+    fn to_lua_value_trailing_comma_ignored() {
+        let (app, field) = font_field_with("MonoLisa, JetBrains Mono,");
+        assert_eq!(
+            app.to_lua_value(&field),
+            "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })"
+        );
+    }
+
+    #[test]
+    fn to_lua_value_extra_whitespace_trimmed() {
+        let (app, field) = font_field_with("  MonoLisa ,  JetBrains Mono  ");
+        assert_eq!(
+            app.to_lua_value(&field),
+            "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })"
+        );
+    }
+
+    #[test]
+    fn to_lua_value_double_comma_skips_empty() {
+        let (app, field) = font_field_with("MonoLisa,, JetBrains Mono");
+        assert_eq!(
+            app.to_lua_value(&field),
+            "wezterm.font_with_fallback({ 'MonoLisa', 'JetBrains Mono' })"
+        );
+    }
+
+    // ── round-trip: to_lua_value → extract_lua_value ─────────────────
+
+    #[test]
+    fn round_trip_single_font() {
+        let (app, field) = font_field_with("MonoLisa");
+        let lua = format!("config.font = {}\n", app.to_lua_value(&field));
+        assert_eq!(
+            App::extract_lua_value(&lua, "font"),
+            Some("MonoLisa".into())
+        );
+    }
+
+    #[test]
+    fn round_trip_two_fonts() {
+        let (app, field) = font_field_with("MonoLisa, JetBrains Mono");
+        let lua = format!("config.font = {}\n", app.to_lua_value(&field));
+        assert_eq!(
+            App::extract_lua_value(&lua, "font"),
+            Some("MonoLisa, JetBrains Mono".into())
+        );
+    }
+
+    #[test]
+    fn round_trip_three_fonts() {
+        let (app, field) = font_field_with("MonoLisa, JetBrains Mono, Courier New");
+        let lua = format!("config.font = {}\n", app.to_lua_value(&field));
+        assert_eq!(
+            App::extract_lua_value(&lua, "font"),
+            Some("MonoLisa, JetBrains Mono, Courier New".into())
         );
     }
 }
